@@ -1,0 +1,580 @@
+#!/usr/bin/env python3
+"""Native Steam controller for the Omarchy SteelSeries plugin.
+
+This daemon wraps the `rivalcfg` library (already installed on the system)
+to control a supported SteelSeries mouse (e.g. the Rival 3 Wireless Gen 2).
+
+Unlike Logitech HID++, SteelSeries mice do *not* report their DPI presets or
+polling rate back to the host; rivalcfg only writes those settings. So this
+daemon persists the last-known DPI/polling/button configuration locally and
+reads the battery level live from the device.
+
+CLI contract (used by Service.qml):
+
+    rivalcfg-daemon --once
+    rivalcfg-daemon --interval <seconds>
+    rivalcfg-daemon --set-dpi 400,800,1600,2400,3200
+    rivalcfg-daemon --set-selected 0
+    rivalcfg-daemon --set-rate 1000
+    rivalcfg-daemon --set-button 6 dpi
+    rivalcfg-daemon --buttons "buttons(button1=button1; ...)"
+    rivalcfg-daemon --reset
+
+Each invocation prints one JSON status object (bounded stdout contract), and
+atomically publishes it to ${XDG_RUNTIME_DIR}/omarchy-rivalcfg-daemon/status.json.
+"""
+
+import json
+import os
+import re
+import sys
+import time
+import errno
+from pathlib import Path
+
+try:
+    from rivalcfg import mouse as rival_mouse
+    from rivalcfg import devices as rival_devices
+except Exception as exc:  # pragma: no cover - library missing
+    rival_mouse = None
+    rival_devices = None
+    _IMPORT_ERROR = str(exc)
+else:
+    _IMPORT_ERROR = None
+
+VID = 0x1038
+PID = 0x1872  # SteelSeries Rival 3 Wireless Gen 2 (2.4 GHz mode)
+
+DPI_MIN = 100
+DPI_MAX = 18000
+DPI_STEP = 100
+MAX_PRESETS = 5
+RATES = [125, 250, 500, 1000]
+DEFAULT_PRESETS = [400, 800, 1600, 2400, 3200]
+DEFAULT_RATE = 1000
+DEFAULT_BUTTONS = {
+    "button1": "button1",
+    "button2": "button2",
+    "button3": "button3",
+    "button4": "button4",
+    "button5": "button5",
+    "button6": "dpi",
+}
+
+DEVICE_NAME = "SteelSeries Rival 3 Wireless Gen 2"
+
+
+def _json_string(value):
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def _state_dir():
+    state_home = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local/state")
+    return Path(state_home) / "omarchy/rivalcfg-daemon"
+
+
+def _runtime_dir():
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if not runtime:
+        raise RuntimeError("XDG_RUNTIME_DIR is not set")
+    return Path(runtime) / "omarchy-rivalcfg-daemon"
+
+
+def default_state():
+    return {
+        "presets": list(DEFAULT_PRESETS),
+        "selected": 0,
+        "rate": DEFAULT_RATE,
+        "buttons": dict(DEFAULT_BUTTONS),
+    }
+
+
+def load_state():
+    path = _state_dir() / "state.json"
+    try:
+        data = json.loads(path.read_text())
+        return _sanitize_state(data)
+    except (OSError, ValueError):
+        return default_state()
+
+
+def _sanitize_state(data):
+    state = default_state()
+    if isinstance(data, dict):
+        presets = data.get("presets")
+        if isinstance(presets, list):
+            cleaned = []
+            for value in presets:
+                try:
+                    value = int(value)
+                except (TypeError, ValueError):
+                    continue
+                value = min(DPI_MAX, max(DPI_MIN, value // DPI_STEP * DPI_STEP))
+                cleaned.append(value)
+            if cleaned:
+                state["presets"] = cleaned[:MAX_PRESETS]
+        try:
+            state["selected"] = int(data.get("selected", 0))
+        except (TypeError, ValueError):
+            state["selected"] = 0
+        state["selected"] = min(max(state["selected"], 0), len(state["presets"]) - 1)
+        try:
+            rate = int(data.get("rate", DEFAULT_RATE))
+        except (TypeError, ValueError):
+            rate = DEFAULT_RATE
+        if rate in RATES:
+            state["rate"] = rate
+        if isinstance(data.get("buttons"), dict):
+            state["buttons"] = data["buttons"]
+    return state
+
+
+def save_state(state):
+    directory = _state_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    os.chmod(directory, 0o700)
+    temporary = directory / ("state-%d.tmp" % os.getpid())
+    temporary.write_text(json.dumps(state, indent=2, ensure_ascii=False))
+    os.chmod(temporary, 0o600)
+    temporary.replace(directory / "state.json")
+
+
+def _open_mouse():
+    if rival_mouse is None:
+        raise RuntimeError("rivalcfg python module is not available: %s" % _IMPORT_ERROR)
+    try:
+        return rival_mouse.get_mouse(vendor_id=VID, product_id=PID)
+    except Exception as exc:
+        raise RuntimeError("No supported SteelSeries device found: %s" % exc)
+
+
+def write_status(value):
+    json_value = value
+    directory = _runtime_dir()
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        os.chmod(directory, 0o700)
+        temporary = directory / ("status-%d.tmp" % os.getpid())
+        temporary.write_text(json_value + "\n")
+        os.chmod(temporary, 0o600)
+        temporary.replace(directory / "status.json")
+    except OSError as exc:
+        sys.stderr.write("state write failed: %s\n" % exc)
+
+
+def normalize_dpi_list(value):
+    parts = re.split(r"[,\s]+", str(value).strip())
+    values = []
+    for part in parts:
+        if not part:
+            continue
+        preset = part.split(":")
+        try:
+            dpi = int(preset[0])
+        except ValueError as exc:
+            raise ValueError("invalid DPI value '%s'" % part) from exc
+        dpi = min(DPI_MAX, max(DPI_MIN, dpi // DPI_STEP * DPI_STEP))
+        values.append(dpi)
+    if not values:
+        raise ValueError("you must provide at least one DPI preset")
+    if len(values) > MAX_PRESETS:
+        raise ValueError("this device accepts a maximum of %d presets" % MAX_PRESETS)
+    return values
+
+
+def battery_status(mouse):
+    level = None
+    is_charging = None
+    for _attempt in range(12):
+        try:
+            result = mouse.battery
+        except Exception:
+            result = None
+        if result and result.get("level") is not None:
+            level = int(result.get("level"))
+            is_charging = result.get("is_charging")
+            break
+        time.sleep(0.25)
+    if level is None:
+        return {"percentage": None, "level": "unknown", "status": "unknown"}
+    if level >= 100:
+        status = "full"
+        level_label = "full"
+    elif is_charging:
+        status = "charging"
+        level_label = "good" if level > 20 else "low"
+    else:
+        status = "discharging"
+        if level <= 5:
+            level_label = "critical"
+        elif level <= 20:
+            level_label = "low"
+        else:
+            level_label = "good"
+    return {"percentage": level, "level": level_label, "status": status}
+
+
+def build_status(mouse=None, error=None):
+    state = load_state()
+    presets = state["presets"]
+    selected = min(state["selected"], len(presets) - 1)
+    current = presets[selected] if presets else 0
+    dpi_min = DPI_MIN
+    dpi_max = DPI_MAX
+
+    if mouse is None:
+        return json.dumps({
+            "connected": False,
+            "deviceName": DEVICE_NAME,
+            "battery": None,
+            "dpi": None,
+            "dpiMin": dpi_min,
+            "dpiMax": dpi_max,
+            "dpiPresets": presets,
+            "dpiSelected": selected,
+            "reportRate": state["rate"],
+            "onboardProfileMode": None,
+            "hasHits": False,
+            "buttons": state["buttons"],
+            "error": error or "",
+            "updatedAt": int(time.time() * 1000),
+        }, ensure_ascii=False)
+
+    battery = battery_status(mouse)
+    battery_json = None
+    if battery["percentage"] is not None:
+        battery_json = battery
+
+    return json.dumps({
+        "connected": True,
+        "deviceName": DEVICE_NAME,
+        "battery": battery_json,
+        "dpi": {
+            "dpiX": current,
+            "defaultDpiX": 0,
+            "dpiY": current,
+            "defaultDpiY": 0,
+            "lod": "unknown",
+        },
+        "dpiMin": dpi_min,
+        "dpiMax": dpi_max,
+        "dpiPresets": presets,
+        "dpiSelected": selected,
+        "reportRate": state["rate"],
+        "onboardProfileMode": None,
+        "hasHits": False,
+        "buttons": state["buttons"],
+        "error": error or "",
+        "updatedAt": int(time.time() * 1000),
+    }, ensure_ascii=False)
+
+
+def apply_dpi(mouse, state, presets):
+    try:
+        mouse.set_sensitivity([[d, d] for d in presets], state["selected"])
+        mouse.save()
+    except Exception as exc:
+        raise RuntimeError("failed to set DPI presets: %s" % exc)
+
+
+def close(mouse):
+    if mouse is not None:
+        try:
+            mouse.close()
+        except Exception:
+            pass
+
+
+def _fresh_status(mouse):
+    try:
+        return build_status(_open_mouse())
+    except RuntimeError:
+        return build_status()
+
+
+def _do_write(writer, mouse):
+    """Run `writer(mouse)` and close the handle, re-raising any error.
+
+    Used by write operations so local state is only committed once the
+    hardware write succeeds.
+    """
+    try:
+        writer(mouse)
+    finally:
+        close(mouse)
+
+
+def set_dpi(state, value):
+    presets = normalize_dpi_list(value)
+    selected = state["selected"]
+    if selected >= len(presets):
+        selected = len(presets) - 1
+    tentative = {
+        "presets": presets,
+        "selected": selected,
+        "rate": state["rate"],
+        "buttons": state["buttons"],
+    }
+
+    def writer(mouse):
+        apply_dpi(mouse, tentative, presets)
+
+    _do_write(writer, _open_mouse())
+    state["presets"] = presets
+    state["selected"] = selected
+    save_state(state)
+    return _fresh_status(None)
+
+
+def set_selected(state, index):
+    try:
+        index = int(index)
+    except (TypeError, ValueError):
+        raise ValueError("invalid preset index")
+    if not 0 <= index < len(state["presets"]):
+        raise ValueError("preset index out of range")
+    tentative = {
+        "presets": state["presets"],
+        "selected": index,
+        "rate": state["rate"],
+        "buttons": state["buttons"],
+    }
+
+    def writer(mouse):
+        apply_dpi(mouse, tentative, state["presets"])
+
+    _do_write(writer, _open_mouse())
+    state["selected"] = index
+    save_state(state)
+    return _fresh_status(None)
+
+
+def set_rate(state, rate):
+    try:
+        rate = int(rate)
+    except (TypeError, ValueError):
+        raise ValueError("invalid polling rate")
+    if rate not in RATES:
+        raise ValueError("polling rate must be one of %s" % RATES)
+
+    def writer(mouse):
+        try:
+            mouse.set_polling_rate(rate)
+            mouse.save()
+        except Exception as exc:
+            raise RuntimeError("failed to set polling rate: %s" % exc)
+
+    _do_write(writer, _open_mouse())
+    state["rate"] = rate
+    save_state(state)
+    return _fresh_status(None)
+
+
+def set_button(state, number, action):
+    try:
+        number = int(number)
+    except (TypeError, ValueError):
+        raise ValueError("invalid button number")
+    if not 1 <= number <= 6:
+        raise ValueError("button number must be between 1 and 6")
+    key = "button%d" % number
+    action = str(action).strip()
+    if action == "":
+        action = DEFAULT_BUTTONS[key]
+    tentative = dict(state["buttons"])
+    tentative[key] = action
+
+    def writer(mouse):
+        buttons_string = _build_buttons_string(tentative)
+        try:
+            mouse.set_buttons_mapping(buttons_string)
+            mouse.save()
+        except Exception as exc:
+            raise RuntimeError("failed to set button mapping: %s" % exc)
+
+    value = _do_write(writer, _open_mouse())
+    state["buttons"] = tentative
+    save_state(state)
+    return _fresh_status(None)
+
+
+def set_buttons(state, value):
+    if value.lower() == "default":
+        tentative = dict(DEFAULT_BUTTONS)
+    else:
+        tentative = _parse_buttons_string(value, "buttons")
+
+    def writer(mouse):
+        buttons_string = _build_buttons_string(tentative)
+        try:
+            mouse.set_buttons_mapping(buttons_string)
+            mouse.save()
+        except Exception as exc:
+            raise RuntimeError("failed to set button mapping: %s" % exc)
+
+    _do_write(writer, _open_mouse())
+    state["buttons"] = tentative
+    save_state(state)
+    return _fresh_status(None)
+
+
+_BUTTON_NAMES = {"button%d" % i for i in range(1, 7)}
+
+
+def _parse_buttons_string(value, empty_name):
+    text = str(value).strip()
+    if text.lower() == "default":
+        return dict(DEFAULT_BUTTONS)
+    if not text.lower().startswith(empty_name + "("):
+        raise ValueError("buttons expression must look like %s(<BUTTON>=<VALUE>; ...)" % empty_name)
+    body = text[text.find("(") + 1:text.rfind(")")]
+    result = {}
+    for chunk in body.split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "=" not in chunk:
+            raise ValueError("invalid mapping item '%s'" % chunk)
+        key, _, val = chunk.partition("=")
+        key = key.strip().lower()
+        val = val.strip().lower()
+        if key == "layout":
+            if val != "qwerty":
+                raise ValueError("unsupported layout '%s'" % val)
+            continue
+        if key not in _BUTTON_NAMES:
+            raise ValueError("this mouse has no button named '%s'" % key)
+        result[key] = val
+    merged = dict(DEFAULT_BUTTONS)
+    merged.update(result)
+    return merged
+
+
+def _build_buttons_string(buttons):
+    pairs = []
+    for i in range(1, 7):
+        key = "button%d" % i
+        pairs.append("%s=%s" % (key, buttons.get(key) or DEFAULT_BUTTONS[key]))
+    return "buttons(%s)" % "; ".join(pairs)
+
+
+def reset_all():
+    state = default_state()
+
+    def writer(mouse):
+        try:
+            mouse.reset_settings()
+            mouse.save()
+        except Exception as exc:
+            raise RuntimeError("failed to reset: %s" % exc)
+
+    _do_write(writer, _open_mouse())
+    state["buttons"] = dict(DEFAULT_BUTTONS)
+    save_state(state)
+    return _fresh_status(None)
+
+
+def _bounded(value, max_bytes=512):
+    return value.encode("utf-8", "replace")[:max_bytes].decode("utf-8", "ignore")
+
+
+def main(argv):
+    args = parse_args(argv)
+    if args["poll_only"]:
+        try:
+            mouse = _open_mouse()
+        except RuntimeError as exc:
+            value = build_status(None, _bounded(str(exc)))
+            print(value)
+            write_status(value)
+            return 1
+        value = build_status(mouse)
+        close(mouse)
+        print(value)
+        write_status(value)
+        return 0
+
+    try:
+        if args.get("reset"):
+            value = reset_all()
+        elif args.get("buttons"):
+            state = load_state()
+            value = set_buttons(state, args["buttons"])
+        elif args.get("set_button"):
+            number, action = args["set_button"]
+            state = load_state()
+            value = set_button(state, number, action)
+        elif args.get("set_rate") is not None:
+            state = load_state()
+            value = set_rate(state, args["set_rate"])
+        elif args.get("set_selected") is not None:
+            state = load_state()
+            value = set_selected(state, args["set_selected"])
+        elif args.get("set_dpi"):
+            state = load_state()
+            value = set_dpi(state, args["set_dpi"])
+        else:
+            mouse = _open_mouse()
+            value = build_status(mouse)
+            close(mouse)
+    except (RuntimeError, ValueError) as exc:
+        value = build_status(None, _bounded(str(exc)))
+        print(value)
+        write_status(value)
+        return 1
+
+    print(value)
+    write_status(value)
+    return 0
+
+
+def parse_args(argv):
+    args = {
+        "poll_only": False,
+        "interval": 15,
+        "reset": False,
+        "set_dpi": None,
+        "set_selected": None,
+        "set_rate": None,
+        "set_button": None,
+        "buttons": None,
+    }
+    values = list(argv)
+    i = 0
+    while i < len(values):
+        value = values[i]
+
+        def next_arg():
+            nonlocal i
+            if i + 1 < len(values):
+                i += 1
+                return values[i]
+            return None
+
+        if value == "--once":
+            args["poll_only"] = True
+        elif value == "--interval":
+            raw = next_arg()
+            if raw is not None and raw.isdigit():
+                args["interval"] = int(raw)
+        elif value == "--reset":
+            args["reset"] = True
+        elif value == "--set-dpi":
+            args["set_dpi"] = next_arg()
+        elif value == "--set-selected":
+            args["set_selected"] = next_arg()
+        elif value == "--set-rate" or value == "--set-report-rate":
+            args["set_rate"] = next_arg()
+        elif value == "--set-button":
+            number = next_arg()
+            action = next_arg()
+            if number is not None and action is not None:
+                args["set_button"] = (number, action)
+        elif value == "--buttons":
+            args["buttons"] = next_arg()
+        i += 1
+    return args
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
