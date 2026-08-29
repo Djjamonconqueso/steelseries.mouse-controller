@@ -16,7 +16,10 @@ This is a **fork** of [ttymayor/oma-logitech-g-mouse](https://github.com/ttymayo
 
 - Omarchy Quattro on Linux.
 - A supported SteelSeries mouse (default target: Rival 3 Wireless Gen 2, `1038:1872`).
-- `rivalcfg` (≥ 4.x) with udev rules installed. On Arch:
+- ```bash
+  yay -S rivalcfg           # AUR: python-rivalcfg
+  sudo udevadm control --reload
+  sudo udevadm trigger
 
   ```bash
   yay -S rivalcfg           # AUR: python-rivalcfg
