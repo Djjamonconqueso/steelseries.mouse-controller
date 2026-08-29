@@ -52,9 +52,7 @@ The widget reconnects automatically after the mouse is plugged back in.
 
 | Control panel                                        |
 | ---------------------------------------------------- |
-| <img width="376" height="540" alt="imagen" src="https://github.com/user-attachments/assets/28501e1f-2e72-4f9d-9b17-f8a0eaca1b7b" />
-<img width="377" height="349" alt="imagen" src="https://github.com/user-attachments/assets/0a0aad70-2bf8-43a9-9a68-89d6608fdd3f" />
- |
+| <img width="376" height="540" alt="imagen" src="https://github.com/user-attachments/assets/28501e1f-2e72-4f9d-9b17-f8a0eaca1b7b" /><img width="377" height="349" alt="imagen" src="https://github.com/user-attachments/assets/0a0aad70-2bf8-43a9-9a68-89d6608fdd3f" />|
 
 ## Compatible devices
 
